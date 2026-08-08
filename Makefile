@@ -11,7 +11,7 @@ DISTRO_TYPE ?= release
 DISTRO ?= openatv
 ONLINECHECK_URL ?= "https://github.com/"
 ONLINECHECK_TIMEOUT ?= 2
-DISTRO_VERSIONS_REPO ?= https://github.com/oe-alliance/distro-versions.git
+DISTRO_VERSIONS_REPO ?= https://github.com/formiano/distro-versions.git
 DISTRO_VERSIONS_DIR = $(TOPDIR)/conf/distro-versions
 
 BUILD_DIR = $(CURDIR)/builds/$(DISTRO)/$(DISTRO_TYPE)/$(MACHINE)
