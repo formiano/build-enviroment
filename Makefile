@@ -18,6 +18,8 @@ BUILD_DIR = $(CURDIR)/builds/$(DISTRO)/$(DISTRO_TYPE)/$(MACHINE)
 TOPDIR = $(BUILD_DIR)
 DL_DIR = $(CURDIR)/sources
 SSTATE_DIR = $(CURDIR)/builds/$(DISTRO)/sstate-cache
+CCACHE_DIR ?= $(CURDIR)/ccache
+CCACHE_CONF ?= $(CURDIR)/ccache.conf
 TMPDIR = $(TOPDIR)/tmp
 DEPDIR = $(TOPDIR)/.deps
 MACHINEBUILD := $(MACHINE)
@@ -47,6 +49,7 @@ CONFFILES = \
 	$(TOPDIR)/conf/$(DISTRO).conf \
 	$(TOPDIR)/conf/bblayers.conf \
 	$(TOPDIR)/conf/local.conf \
+	$(CCACHE_CONF) \
 	$(TOPDIR)/conf/site.conf
 
 CONFDEPS = \
@@ -186,7 +189,7 @@ update:
 		cd .. ; \
 	fi
 
-.PHONY: all image enigma2-image shell-image server-image base-image feed devel init initialize update update-versions usage machinebuild list
+.PHONY: all image enigma2-image shell-image server-image base-image feed devel init initialize update update-versions usage machinebuild list sstate-stats sstate-clean
 
 BITBAKE_ENV_HASH := $(call hash, \
 	'BITBAKE_ENV_VERSION = "0"' \
@@ -251,7 +254,14 @@ $(TOPDIR)/conf/local.conf: $(DEPDIR)/.local.conf.$(LOCAL_CONF_HASH)
 	@echo 'require $(TOPDIR)/conf/$(DISTRO).conf' >> $@
 
 $(TOPDIR)/conf/site.conf: $(CURDIR)/site.conf
-	@ln -s ../../../../../site.conf $@
+	@ln -sf ../../../../../site.conf $@
+
+$(CCACHE_CONF):
+	@echo 'sloppiness = include_file_ctime' > $@
+	@echo 'hash_dir = false' >> $@
+	@echo 'temporary_dir = /dev/shm/ccache-tmp' >> $@
+	@echo 'compiler_check = content' >> $@
+	@echo 'max_size = 50G' >> $@
 
 $(CURDIR)/site.conf:
 	@echo 'SCONF_VERSION = "1"' >> $@
@@ -262,6 +272,14 @@ $(CURDIR)/site.conf:
 	@echo 'SSTATE_DIR = "$(SSTATE_DIR)"' >> $@
 	@echo 'BB_HASHSERVE_DB_DIR = "$(SSTATE_DIR)"' >> $@
 	@echo 'INHERIT += "rm_work"' >> $@
+	@echo '# ccache: uncomment the six lines below, needs ccache installed on the host.' >> $@
+	@echo '# The noexec keeps "bitbake -c cleanall" from wiping the shared cache.' >> $@
+	@echo '#INHERIT += "ccache"' >> $@
+	@echo '#CCACHE_DIR = "$(CCACHE_DIR)"' >> $@
+	@echo '#do_cleanccache[noexec] = "1"' >> $@
+	@echo '#export CCACHE_CONFIGPATH = "$(CCACHE_CONF)"' >> $@
+	@echo '#ASSUME_PROVIDED += "ccache-native"' >> $@
+	@echo '#HOSTTOOLS += "ccache"' >> $@
 	@echo 'INHERIT:remove = "create-spdx"' >> $@
 	@echo '#BB_GIT_SHALLOW_DEPTH = "1"' >> $@
 	@echo 'BB_GIT_SHALLOW = "0"' >> $@
@@ -368,3 +386,69 @@ export LIST_SCRIPT
 
 list:
 	@python3 -c "$$LIST_SCRIPT" "$(METADIR)" $(FILTERS)
+
+# sstate cache breakdown by package arch; with MACHINE set, restricted to
+# that machine PACKAGE_ARCHS (env.source needs bash, hence the bash -c).
+sstate-stats:
+	@dir='$(SSTATE_DIR)'; machine='$(if $(MACHINEBUILD),$(MACHINE),)'; topdir='$(TOPDIR)'; distro='$(DISTRO)'; \
+	[ -d "$$dir" ] || { echo "no sstate-cache: $$dir (DISTRO=$$distro?)"; exit 1; }; \
+	want=''; \
+	if [ -n "$$machine" ] && [ -f "$$topdir/env.source" ]; then \
+	want=$$(bash -c "cd \"$$topdir\"; . env.source >/dev/null 2>&1; echo \$$(bitbake-getvar -q --value PACKAGE_ARCHS 2>/dev/null) \$$(bitbake-getvar -q --value BUILD_ARCH 2>/dev/null)"); \
+	fi; \
+	echo "sstate-cache: $$dir  ($$distro)"; \
+	echo; \
+	find -L "$$dir" -name 'sstate:*' ! -name '*.siginfo' -printf '%s\t%f\n' 2>/dev/null | LC_ALL=C awk -F'\t' -v want="$$want" '\
+	function hum(b,  u,i) { split("B KiB MiB GiB TiB", u, " "); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } return sprintf("%.1f %s", b, u[i]) } \
+	BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) keep[w[i]] = 1 } \
+	{ split($$2, f, ":"); a = f[3]; sub(/(-oe)?-linux[a-z0-9._-]*$$/, "", a); if (a == "") next; \
+	  if (length(want) == 0 || keep[a]) { c[a]++; s[a] += $$1; C++; S += $$1; if (length(a) > L) L = length(a) } } \
+	END { printf "%7s  %13s  %s\n", "COUNT", "SIZE", "ARCH"; fflush(); \
+	      for (a in c) printf "%d\t%7d  %13s  %s\n", c[a], c[a], hum(s[a]), a | "sort -rn | cut -f2-"; \
+	      close("sort -rn | cut -f2-"); \
+	      while (length(sep) < 24 + L) sep = sep "-"; \
+	      printf "%s\n%7d  %13s  %s\n", sep, C, hum(S), "TOTAL" }'
+
+# Drop sstate objects that no build directory of this DISTRO still references.
+# Dry run unless FORCE is set.
+sstate-clean:
+	@dir='$(SSTATE_DIR)'; \
+	[ -d "$$dir" ] || { echo "no sstate-cache: $$dir (DISTRO=$(DISTRO)?)"; exit 1; }; \
+	echo "sstate-cache: $$dir  ($(DISTRO))"; \
+	echo; \
+	args=''; n=0; stamps=''; \
+	for s in $(CURDIR)/builds/$(DISTRO)/*/*/tmp/stamps; do \
+	  [ -d "$$s" ] || continue; \
+	  args="$$args --stamps-dir=$$s"; stamps="$$stamps $$s"; n=$$((n + 1)); \
+	done; \
+	[ $$n -gt 0 ] || { echo "no build directory found below builds/$(DISTRO) - refusing, this would wipe the cache"; exit 1; }; \
+	echo "$$n build directories checked - what they still reference is kept, the rest is dropped:"; \
+	echo; \
+	mark=$$(mktemp); \
+	find -L $$stamps -mindepth 3 -maxdepth 3 -type f \( -name '*.do_*.sigdata.*' -o -name '*.do_*_setscene.*' \) -printf '%f\n' 2>/dev/null \
+	  | sed -e 's/.*\.sigdata\.//' -e 's/.*_setscene\.//' | grep -oE '^[0-9a-f]{64}' | sort -u > $$mark; \
+	find -L "$$dir" -type f -name 'sstate:*' -printf '%s\t%f\n' 2>/dev/null | LC_ALL=C awk -F'\t' -v markfile="$$mark" '\
+	function hum(b,  u,i) { split("B KiB MiB GiB TiB", u, " "); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } return sprintf("%.1f %s", b, u[i]) } \
+	BEGIN { while ((getline h < markfile) > 0) mark[h] = 1 } \
+	{ split($$2, f, ":"); a = f[3]; sub(/(-oe)?-linux[a-z0-9._-]*$$/, "", a); if (a == "") a = "(swspec)"; \
+	  t[a]++; T++; if (length(a) > L) L = length(a); \
+	  if (!match($$2, /:14:[0-9a-f]+_/)) next; \
+	  if (substr($$2, RSTART + 4, RLENGTH - 5) in mark) next; \
+	  c[a]++; s[a] += $$1; C++; S += $$1 } \
+	END { if (C == 0) { print "  nothing to drop"; exit } \
+	      printf "%7s  %13s  %-*s  %7s\n", "DROPPED", "SIZE", L, "ARCH", "KEPT"; fflush(); \
+	      for (a in c) printf "%d\t%7d  %13s  %-*s  %7d\n", c[a], c[a], hum(s[a]), L, a, t[a] - c[a] | "sort -rn | cut -f2-"; \
+	      close("sort -rn | cut -f2-"); \
+	      while (length(sep) < 33 + L) sep = sep "-"; \
+	      printf "%s\n%7d  %13s  %-*s  %7d\n", sep, C, hum(S), L, "TOTAL", T - C }'; \
+	rm -f $$mark; \
+	echo; \
+	if [ -n "$(FORCE)" ]; then \
+	  log=$$(mktemp); \
+	  $(CURDIR)/openembedded-core/scripts/sstate-cache-management.py --cache-dir="$$dir" $$args -j $(NR_CPU) -y -v > $$log 2>&1; rc=$$?; \
+	  sed 's/ files will be removed!$$/ files removed/' $$log; rm -f $$log; \
+	  [ $$rc -eq 0 ] || exit $$rc; \
+	else \
+	  $(CURDIR)/openembedded-core/scripts/sstate-cache-management.py --cache-dir="$$dir" $$args -j $(NR_CPU) -n -y; \
+	  echo "dry run - repeat as 'FORCE=1 DISTRO=$(DISTRO) $(MAKE) sstate-clean' to actually remove"; \
+	fi
